@@ -646,12 +646,18 @@ static HRESULT dxgi_vk_swap_chain_allocate_user_buffer(struct dxgi_vk_swap_chain
     struct d3d12_device *device = chain->queue->device;
     D3D12_RESOURCE_DESC1 resource_desc;
     D3D12_HEAP_PROPERTIES heap_props;
+    const char *force_4k = getenv("VKD3D_FORCE_4K"); /
 
     memset(&resource_desc, 0, sizeof(resource_desc));
     memset(&heap_props, 0, sizeof(heap_props));
 
-    resource_desc.Width = pDesc->Width;
-    resource_desc.Height = pDesc->Height;
+    if (force_4k && strcmp(force_4k, "1") == 0) {
+        resource_desc.Width = 3840;
+        resource_desc.Height = 2160;
+    } else {
+        resource_desc.Width = pDesc->Width;
+        resource_desc.Height = pDesc->Height;
+    }
     resource_desc.Format = pDesc->Format;
     resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
