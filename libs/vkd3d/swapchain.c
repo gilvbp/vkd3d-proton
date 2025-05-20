@@ -646,18 +646,21 @@ static HRESULT dxgi_vk_swap_chain_allocate_user_buffer(struct dxgi_vk_swap_chain
     struct d3d12_device *device = chain->queue->device;
     D3D12_RESOURCE_DESC1 resource_desc;
     D3D12_HEAP_PROPERTIES heap_props;
-    const char *force_4k = getenv("VKD3D_FORCE_4K"); /
+    const char *force_4k = getenv("VKD3D_FORCE_4K");
 
     memset(&resource_desc, 0, sizeof(resource_desc));
     memset(&heap_props, 0, sizeof(heap_props));
 
+   
     if (force_4k && strcmp(force_4k, "1") == 0) {
-        resource_desc.Width = 3840;
-        resource_desc.Height = 2160;
+      TRACE("VKD3D: Forcing resolution to 3840x2160 via VKD3D_FORCE_4K\n");
+      resource_desc.Width = 3840;
+      resource_desc.Height = 2160;
     } else {
-        resource_desc.Width = pDesc->Width;
-        resource_desc.Height = pDesc->Height;
+      resource_desc.Width = pDesc->Width;
+      resource_desc.Height = pDesc->Height;
     }
+
     resource_desc.Format = pDesc->Format;
     resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2989,17 +2992,28 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
 {
     HRESULT hr;
 
+    // Copia modificável do pDesc
+    DXGI_SWAP_CHAIN_DESC1 localDesc = *pDesc;
+
+    // Override de resolução via variável de ambiente
+    const char *force_4k = getenv("VKD3D_FORCE_4K");
+    if (force_4k && strcmp(force_4k, "1") == 0) {
+        TRACE("VKD3D: Forcing 4K resolution from dxgi_vk_swap_chain_init override\n");
+        localDesc.Width = 3840;
+        localDesc.Height = 2160;
+    }
+
     chain->IDXGIVkSwapChain_iface.lpVtbl = &dxgi_vk_swap_chain_vtbl;
     chain->refcount = 1;
     chain->internal_refcount = 1;
     chain->queue = queue;
-    chain->desc = *pDesc;
+    chain->desc = localDesc;
 
     chain->swapchain_maintenance1 =
             queue->device->device_info.swapchain_maintenance1_features.swapchainMaintenance1 == VK_TRUE;
 
     INFO("Creating swapchain (%u x %u), BufferCount = %u.\n",
-            pDesc->Width, pDesc->Height, pDesc->BufferCount);
+            localDesc.Width, localDesc.Height, localDesc.BufferCount);
 
     if (FAILED(hr = dxgi_vk_swap_chain_reallocate_user_buffers(chain)))
         goto cleanup_common;
@@ -3034,6 +3048,7 @@ cleanup_common:
     dxgi_vk_swap_chain_cleanup_common(chain);
     return hr;
 }
+
 
 static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_factory_CreateSwapChain(IDXGIVkSwapChainFactory *iface,
         IDXGIVkSurfaceFactory *pFactory, const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGIVkSwapChain **ppSwapchain)
