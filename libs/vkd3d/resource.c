@@ -930,9 +930,10 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
             if (sparse_infos[i].aspectMask & VK_IMAGE_ASPECT_METADATA_BIT)
                 continue;
 
-            if (vkd3d_sparse_image_may_have_mip_tail(desc, format, &sparse_infos[i]) && desc->DepthOrArraySize > 1 && desc->MipLevels > 1)
+            if (device->d3d12_caps.options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_4 &&
+                    vkd3d_sparse_image_may_have_mip_tail(desc, format, &sparse_infos[i]) && desc->DepthOrArraySize > 1 && desc->MipLevels > 1)
             {
-                WARN("Multiple array layers not supported for sparse images with mip tail.\n");
+                WARN("Sparse array images with mip tail require TILED_RESOURCES_TIER_4.\n");
                 return E_INVALIDARG;
             }
         }
@@ -3353,10 +3354,24 @@ static HRESULT d3d12_resource_init_sparse_info(struct d3d12_resource *resource,
         }
         else if (sparse->packed_mips.NumPackedMips && i >= sparse->packed_mips.StartTileIndexInOverallResource)
         {
-            VkDeviceSize offset = VKD3D_TILE_SIZE * (i - sparse->packed_mips.StartTileIndexInOverallResource);
-            sparse->tiles[i].buffer.offset = vk_memory_requirements.imageMipTailOffset + offset;
-            sparse->tiles[i].buffer.length = align(min(VKD3D_TILE_SIZE, vk_memory_requirements.imageMipTailSize - offset),
-                    VKD3D_TILE_SIZE);
+            unsigned int tile_index = i - sparse->packed_mips.StartTileIndexInOverallResource;
+            unsigned int layer_index = 0;
+            unsigned int tile_offset;
+
+            if ((!(vk_memory_requirements.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT)) &&
+                    resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            {
+                unsigned int tiles_per_layer = align(vk_memory_requirements.imageMipTailSize, VKD3D_TILE_SIZE) / VKD3D_TILE_SIZE;
+
+                layer_index = tile_index / tiles_per_layer;
+                tile_index %= tiles_per_layer;
+            }
+
+            tile_offset = VKD3D_TILE_SIZE * tile_index;
+
+            sparse->tiles[i].buffer.offset = vk_memory_requirements.imageMipTailOffset +
+                vk_memory_requirements.imageMipTailStride * layer_index + tile_offset;
+            sparse->tiles[i].buffer.length = min(VKD3D_TILE_SIZE, vk_memory_requirements.imageMipTailSize - tile_offset);
         }
         else
         {
@@ -3779,6 +3794,16 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         allocate_info.heap_flags = heap_flags;
         allocate_info.explicit_global_buffer_usage = 0;
 
+        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS))
+        {
+            /* Unfortunately, we cannot trust CREATE_NOT_ZEROED to actually do anything.
+             * Stress tests on Windows suggest that it drivers always clear anyway.
+             * This suggests we have a lot of potential game bugs in the wild that will randomly be exposed
+             * if we try to skip clears.
+             * For render targets, we expect the transition away from UNDEFINED to deal with it. */
+            allocate_info.heap_flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        }
+
         if (object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
         {
             assert(!(heap_flags & D3D12_HEAP_FLAG_SHARED));
@@ -3792,7 +3817,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             allocation = &object->mem;
         }
 
-        if (vkd3d_allocate_image_memory_prefers_dedicated(device, heap_flags, &allocate_info.memory_requirements))
+        if (vkd3d_allocate_image_memory_prefers_dedicated(device, allocate_info.heap_flags, &allocate_info.memory_requirements))
             dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
 
         if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
@@ -3910,11 +3935,12 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         allocate_info.heap_desc.Flags = heap_flags | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
         allocate_info.vk_memory_priority = object->priority.residency_count ? vkd3d_convert_to_vk_prio(object->priority.d3d12priority) : 0.f;
 
-        /* Be very careful with suballocated buffers. */
-        if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ZERO_MEMORY_WORKAROUNDS_COMMITTED_BUFFER_UAV) &&
-                (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-                desc->Width < VKD3D_VA_BLOCK_SIZE)
+        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS))
         {
+            /* Unfortunately, we cannot trust CREATE_NOT_ZEROED to actually do anything.
+             * Stress tests on Windows suggest that it drivers always clear anyway.
+             * This suggests we have a lot of potential game bugs in the wild that will randomly be exposed
+             * if we try to skip clears. */
             allocate_info.heap_desc.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
         }
 
@@ -5838,6 +5864,23 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
         VK_CALL(vkUpdateDescriptorSets(device->vk_device, vk_write_count, vk_write, 0, NULL));
 }
 
+static void vkd3d_texture_view_desc_fixup(struct d3d12_device *device, struct vkd3d_texture_view_desc *desc)
+{
+    if (device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA)
+    {
+        FIXME_ONCE("Remapping 2D to 2D_ARRAY. Needs Vulkan spec tightening to match D3D12 properly.\n");
+        /* D3D allows some reinterpretation between Texture2D and Texture2DArray.
+         * Texture2D in shader can read a resource with 1 array layer,
+         * and Texture2DArray can read a Texture2D descriptor.
+         * NVIDIA does not correctly deal with Texture2DArray unless we always emit 2D_ARRAY views.
+         * Other implementations don't seem to care, so just emit the natural 2D view. */
+        if (desc->view_type == VK_IMAGE_VIEW_TYPE_1D)
+            desc->view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+        if (desc->view_type == VK_IMAGE_VIEW_TYPE_2D)
+            desc->view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    }
+}
+
 static struct vkd3d_view *vkd3d_create_texture_uav_view(struct d3d12_device *device,
         struct d3d12_resource *resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
 {
@@ -5916,6 +5959,8 @@ static struct vkd3d_view *vkd3d_create_texture_uav_view(struct d3d12_device *dev
                 FIXME("Unhandled view dimension %#x.\n", desc->ViewDimension);
         }
     }
+
+    vkd3d_texture_view_desc_fixup(device, &key.u.texture);
 
     return vkd3d_view_map_create_view(&resource->view_map, device, &key);
 }
@@ -6016,6 +6061,8 @@ static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *dev
 
     if (key.u.texture.miplevel_count == VK_REMAINING_MIP_LEVELS)
         key.u.texture.miplevel_count = resource->desc.MipLevels - key.u.texture.miplevel_idx;
+
+    vkd3d_texture_view_desc_fixup(device, &key.u.texture);
 
     if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_PREALLOCATE_SRV_MIP_CLAMPS) &&
             desc->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DMS &&
